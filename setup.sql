@@ -14,17 +14,16 @@ create or replace function clash_private.shuffle(a jsonb) returns jsonb
 language sql volatile set search_path = '' as $$
  select coalesce(jsonb_agg(value order by random()), '[]'::jsonb) from jsonb_array_elements(a)
 $$;
-drop function if exists clash_private.deck(text);
-create or replace function clash_private.deck(mode text default 'regular', packs int default 1) returns jsonb
+create or replace function clash_private.deck(mode text default 'regular') returns jsonb
 language plpgsql volatile set search_path = '' as $$
 declare d jsonb := '[]'; c text; v text; copies int; k int; pack int; id int := 0; vals text[];
 begin
- for pack in 1..packs loop
+ for pack in 1..2 loop
   foreach c in array array['red','yellow','green','blue'] loop
    vals:=array['0','1','2','3','4','5','6','7','8','9','skip','reverse','+2'];
    if mode='mercy' then vals:=vals || array['+4','skipall','discard']; end if;
    foreach v in array vals loop
-    copies:=case when mode='regular' and v='0' then 1 when mode='mercy' and v in ('skip','reverse','+2','discard') then 3 else 2 end;
+    copies:=case when mode='regular' and v='0' then 1 when v='discard' then 3 else 2 end;
     for k in 1..copies loop
      id:=id+1; d:=d || jsonb_build_array(jsonb_build_object('id',id,'color',c,'value',v));
     end loop;
@@ -32,7 +31,7 @@ begin
   end loop;
   vals:=case when mode='mercy' then array['reverse4','+6','+10','roulette'] else array['wild','+4'] end;
   foreach v in array vals loop
-   copies:=case when mode='mercy' and v in ('reverse4','roulette') then 8 else 4 end;
+   copies:=case when mode='mercy' then case when v='roulette' then 12 else 8 end else 4 end;
    for k in 1..copies loop
     id:=id+1; d:=d || jsonb_build_array(jsonb_build_object('id',id,'color','wild','value',v));
    end loop;
@@ -59,28 +58,15 @@ begin
 end $$;
 create or replace function clash_private.draw(s jsonb, seat int, amount int) returns jsonb
 language plpgsql volatile set search_path = '' as $$
-declare d jsonb:=s->'deck'; pile jsonb:=s->'pile'; h jsonb:=s->'players'->seat->'hand'; k int; retired jsonb:=coalesce(s->'retired','[]'::jsonb); fresh jsonb; first_id int; max_id int;
- elimination boolean:=s->'settings'->>'mode'='mercy' and coalesce((s->'settings'->>'eliminate25')::boolean,false);
+declare d jsonb:=s->'deck'; pile jsonb:=s->'pile'; h jsonb:=s->'players'->seat->'hand'; k int; retired jsonb:=coalesce(s->'retired','[]'::jsonb);
 begin
  for k in 1..amount loop
-  exit when elimination and jsonb_array_length(h)>=25;
+  exit when s->'settings'->>'mode'='mercy' and jsonb_array_length(h)>=25;
   if jsonb_array_length(d)=0 then
    d:=clash_private.shuffle((pile - (jsonb_array_length(pile)-1)) || retired); retired:='[]';
    if jsonb_array_length(pile)>0 then pile:=jsonb_build_array(pile->(jsonb_array_length(pile)-1)); end if;
   end if;
-  if jsonb_array_length(d)=0 then
-   -- Everybody may be holding the remaining cards when elimination is off.
-   -- Add one WHOLE base deck, with fresh IDs, instead of truncating a penalty.
-   select coalesce(max((x->>'id')::int),0) into max_id from (
-    select value x from jsonb_array_elements(coalesce(s->'deck','[]') || coalesce(s->'pile','[]') || coalesce(s->'retired','[]') || h)
-    union all select card from jsonb_array_elements(s->'players') p cross join lateral jsonb_array_elements(p->'hand') card
-   ) all_cards;
-   first_id:=greatest(coalesce((s->>'nextCardId')::int,1),max_id+1);
-   fresh:=clash_private.deck(s->'settings'->>'mode',1);
-   select jsonb_agg(jsonb_set(value,'{id}',to_jsonb((value->>'id')::int+first_id-1)) order by ordinality) into d from jsonb_array_elements(fresh) with ordinality;
-   s:=jsonb_set(s,'{nextCardId}',to_jsonb(first_id+jsonb_array_length(fresh)));
-   s:=jsonb_set(s,'{deckCopies}',to_jsonb(coalesce((s->>'deckCopies')::int,1)+1));
-  end if;
+  exit when jsonb_array_length(d)=0;
   h:=h || jsonb_build_array(d->0); d:=d-0;
  end loop;
  s:=jsonb_set(s,'{deck}',d); s:=jsonb_set(s,'{pile}',pile); s:=jsonb_set(s,'{retired}',retired);
@@ -98,7 +84,7 @@ create or replace function clash_private.finish(s jsonb) returns jsonb
 language plpgsql set search_path = '' as $$
 declare i int; ps jsonb; retired jsonb:=coalesce(s->'retired','[]'); active int;
 begin
- if s->'settings'->>'mode'='mercy' and coalesce((s->'settings'->>'eliminate25')::boolean,false) then
+ if s->'settings'->>'mode'='mercy' then
   for i in 0..jsonb_array_length(s->'players')-1 loop
    if jsonb_array_length(s->'players'->i->'hand')>=25 and not coalesce((s->'players'->i->>'out')::boolean,false) then
     retired:=retired || (s->'players'->i->'hand');
@@ -138,14 +124,13 @@ begin
   'players',ps,'hand',mine,'turn',s->'turn','direction',s->'direction','color',s->'color',
   'top',(s->'pile')->(jsonb_array_length(s->'pile')-1),
   'drawn',case when s->'players'->((s->>'turn')::int)->>'id'=uid::text then s->'drawn' else 'null'::jsonb end,
-  'skipJump',s->'skipJump','pending',s->'pending','minimum',s->'minimum','roulette',s->'roulette','winner',s->'winner',
-  'deckCopies',coalesce(s->'deckCopies','0'::jsonb),'message',s->>'message','deadline',s->'deadline','serverTime',extract(epoch from clock_timestamp()));
+  'pending',s->'pending','minimum',s->'minimum','roulette',s->'roulette','winner',s->'winner',
+  'message',s->>'message','deadline',s->'deadline','serverTime',extract(epoch from clock_timestamp()));
 end $$;
 -- Remove the old prototype overload if updating an earlier copy.
 drop function if exists public.clash_enter(text,text);
-drop function if exists public.clash_enter(text,text,text,boolean,boolean);
 create or replace function public.clash_enter(p_name text, p_code text default null, p_mode text default 'regular',
- p_jump boolean default false, p_double boolean default false, p_elimination boolean default false) returns jsonb
+ p_jump boolean default false, p_double boolean default false) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare uid uuid:=auth.uid(); r clash_private.rooms; c text; s jsonb; nm text:=left(trim(p_name),20); ps jsonb;
 begin
@@ -161,8 +146,8 @@ begin
    exit when not exists(select 1 from clash_private.rooms where code=c);
   end loop;
   s:=jsonb_build_object('phase','lobby','players',jsonb_build_array(jsonb_build_object('id',uid,'name',nm,'hand','[]'::jsonb,'out',false,'left',false)),
-    'settings',jsonb_build_object('mode',p_mode,'jump',coalesce(p_jump,false),'double',coalesce(p_double,false),'eliminate25',p_mode='mercy' and coalesce(p_elimination,false)),
-    'deck','[]'::jsonb,'pile','[]'::jsonb,'retired','[]'::jsonb,'turn',0,'direction',1,'drawn',null,'skipJump',null,'pending',0,'minimum',0,'roulette',false,'message',nm || ' opened the room.');
+    'settings',jsonb_build_object('mode',p_mode,'jump',coalesce(p_jump,false),'double',coalesce(p_double,false)),
+    'deck','[]'::jsonb,'pile','[]'::jsonb,'retired','[]'::jsonb,'turn',0,'direction',1,'drawn',null,'pending',0,'minimum',0,'roulette',false,'message',nm || ' opened the room.');
   insert into clash_private.rooms(code,host,state) values(c,uid,s);
  else
   c:=upper(trim(p_code)); select * into r from clash_private.rooms where code=c for update;
@@ -170,6 +155,7 @@ begin
   s:=r.state; ps:=s->'players';
   if exists(select 1 from jsonb_array_elements(ps) p where p->>'id'=uid::text and not coalesce((p->>'left')::boolean,false)) then return public.clash_state(c); end if;
   if s->>'phase'<>'lobby' then raise exception 'Game already started. Ask the host to return to the lobby after this round.'; end if;
+  if jsonb_array_length(ps)>=15 then raise exception 'This room is full (15 players).'; end if;
   s:=jsonb_set(s,'{players}',ps || jsonb_build_array(jsonb_build_object('id',uid,'name',nm,'hand','[]'::jsonb,'out',false,'left',false)));
   s:=jsonb_set(s,'{message}',to_jsonb(nm || ' joined.'));
   update clash_private.rooms set state=s,version=version+1,updated_at=now() where code=c;
@@ -184,12 +170,12 @@ create or replace function public.clash_action(p_code text, p_version int, p_act
 language plpgsql security definer set search_path = '' as $$
 declare uid uuid:=auth.uid(); r clash_private.rooms; s jsonb; ps jsonb; h jsonb; oldhands jsonb; card jsonb; topcard jsonb; extras jsonb; item jsonb;
  seat int; n int; i int; j int; target int; steps int:=1; amount int:=0; before_count int; picked int; copies int:=1; idx int; jump boolean:=false;
- nm text; val text; msg text; mode text; advance boolean:=false; turnseat int; countbefore int; timeout boolean:=false; elimination boolean:=false; packs int;
+ nm text; val text; msg text; mode text; advance boolean:=false; turnseat int; countbefore int; timeout boolean:=false;
 begin
  if uid is null then raise exception 'Please reconnect.'; end if;
  select * into r from clash_private.rooms where code=upper(trim(p_code)) for update;
  if not found then raise exception 'Room no longer exists.'; end if;
- s:=r.state; ps:=s->'players'; n:=jsonb_array_length(ps); mode:=s->'settings'->>'mode'; elimination:=mode='mercy' and coalesce((s->'settings'->>'eliminate25')::boolean,false);
+ s:=r.state; ps:=s->'players'; n:=jsonb_array_length(ps); mode:=s->'settings'->>'mode';
  for i in 0..n-1 loop if ps->i->>'id'=uid::text and not coalesce((ps->i->>'left')::boolean,false) then seat:=i; end if; end loop;
  if seat is null then raise exception 'Join this room first.'; end if;
  if p_version is distinct from r.version then raise exception 'The room changed. Try again.'; end if;
@@ -218,28 +204,17 @@ begin
   if uid<>r.host or s->>'phase'<>'finished' then raise exception 'Only the host can reopen a finished game.'; end if;
   select coalesce(jsonb_agg(jsonb_set(jsonb_set(p,'{hand}','[]'),'{out}','false')),'[]') into ps from jsonb_array_elements(ps) p where not coalesce((p->>'left')::boolean,false);
   s:=jsonb_set(s,'{players}',ps); s:=jsonb_set(s,'{phase}','"lobby"');
-  s:=s || jsonb_build_object('deck','[]'::jsonb,'pile','[]'::jsonb,'retired','[]'::jsonb,'turn',0,'drawn',null,'skipJump',null,'pending',0,'minimum',0,'roulette',false);
+  s:=s || jsonb_build_object('deck','[]'::jsonb,'pile','[]'::jsonb,'retired','[]'::jsonb,'turn',0,'drawn',null,'pending',0,'minimum',0,'roulette',false);
   s:=s-'winner'-'deadline'; msg:='Lobby open. Invite friends or start again.';
- elsif p_action='reorder' then
-  if uid<>r.host then raise exception 'Only the host can change the starting order.'; end if;
-  if s->>'phase'<>'lobby' then raise exception 'Starting order can only be changed in the lobby.'; end if;
-  if p_card is null or p_card<0 or p_card>=n then raise exception 'Choose a valid position in the order.'; end if;
-  select value,(ordinality-1)::int into item,idx from jsonb_array_elements(ps) with ordinality where value->>'id'=p_target;
-  if item is null then raise exception 'That player is no longer in the room.'; end if;
-  ps:=ps-idx; ps:=jsonb_insert(ps,array[p_card::text],item);
-  s:=jsonb_set(s,'{players}',ps); s:=jsonb_set(s,'{turn}','0');
-  msg:='Host updated the order. ' || (ps->0->>'name') || ' will start.';
  elsif p_action='start' then
   if uid<>r.host then raise exception 'Only the host can start.'; end if;
   if s->>'phase'<>'lobby' then raise exception 'Return to the lobby first.'; end if;
   if n<2 then raise exception 'You need at least two players.'; end if;
-  packs:=greatest(1,ceil((n::numeric*14+1)/(case when mode='mercy' then 168 else 108 end))::int);
-  s:=jsonb_set(s,'{deck}',clash_private.deck(mode,packs));
-  s:=jsonb_set(s,'{deckCopies}',to_jsonb(packs)); s:=jsonb_set(s,'{nextCardId}',to_jsonb(jsonb_array_length(s->'deck')+1)); s:=jsonb_set(s,'{pile}','[]'); s:=jsonb_set(s,'{retired}','[]');
+  s:=jsonb_set(s,'{deck}',clash_private.deck(mode)); s:=jsonb_set(s,'{pile}','[]'); s:=jsonb_set(s,'{retired}','[]');
   for i in 0..n-1 loop s:=jsonb_set(s,array['players',i::text,'hand'],'[]'); s:=clash_private.draw(s,i,7); end loop;
   select value,(ordinality-1)::int into card,idx from jsonb_array_elements(s->'deck') with ordinality where value->>'value' ~ '^[0-9]$' limit 1;
   s:=jsonb_set(s,'{deck}',(s->'deck')-idx); s:=jsonb_set(s,'{pile}',jsonb_build_array(card));
-  s:=s || jsonb_build_object('color',card->>'color','phase','playing','turn',0,'direction',1,'drawn',null,'skipJump',null,'pending',0,'minimum',0,'roulette',false,'deadline',extract(epoch from clock_timestamp())+120);
+  s:=s || jsonb_build_object('color',card->>'color','phase','playing','turn',floor(random()*n)::int,'direction',1,'drawn',null,'pending',0,'minimum',0,'roulette',false,'deadline',extract(epoch from clock_timestamp())+120);
   s:=s-'winner'; msg:='Cards dealt. Let’s play!';
  else
   if s->>'phase'<>'playing' then raise exception 'The game is not running.'; end if;
@@ -257,7 +232,6 @@ begin
    if card is null then raise exception 'That card is not in your hand.'; end if;
    jump:=seat<>turnseat;
    if jump then
-    if s->>'skipJump'=uid::text then raise exception 'Taking a draw penalty ends your turn. Wait for another card to be played before jumping in.'; end if;
     if not coalesce((s->'settings'->>'jump')::boolean,false) or card->>'color'<>topcard->>'color' or card->>'value'<>topcard->>'value' then raise exception 'Wait for your turn, or jump in with an exact matching card.'; end if;
     if (s->>'roulette')::boolean or (s->>'pending')::int>0 then raise exception 'Resolve the draw penalty before jumping in.'; end if;
    elsif s->>'drawn' is not null and (s->>'drawn')::int<>p_card then raise exception 'You can only play the card you just drew.';
@@ -278,7 +252,6 @@ begin
     if idx is null then raise exception 'You need two identical cards (same colour and symbol).'; end if;
     s:=jsonb_set(s,'{pile}',(s->'pile') || jsonb_build_array(h->idx)); h:=h-idx; copies:=2;
    end if;
-   s:=jsonb_set(s,'{skipJump}','null');
    s:=jsonb_set(s,'{turn}',to_jsonb(seat));
    if mode='mercy' and val='discard' then
     select coalesce(jsonb_agg(value),'[]') into extras from jsonb_array_elements(h) where value->>'color'=card->>'color';
@@ -301,7 +274,6 @@ begin
       s:=jsonb_set(s,'{pending}',to_jsonb((s->>'pending')::int+amount*copies)); s:=jsonb_set(s,'{minimum}',to_jsonb(amount));
      else
       target:=clash_private.next_seat(s); s:=clash_private.draw(s,target,amount*copies); steps:=2;
-      s:=jsonb_set(s,'{skipJump}',ps->target->'id');
       msg:=msg || ' ' || (ps->target->>'name') || ' draws ' || amount*copies || ' and misses a turn.';
      end if;
     end if;
@@ -335,18 +307,17 @@ begin
     if not timeout and p_action<>'roulette' then raise exception 'Choose a roulette colour first.'; end if;
     if timeout then p_color:='red'; end if;
     if p_color is null or p_color not in ('red','yellow','green','blue') then raise exception 'Choose a colour.'; end if;
-    loop
+    for j in 1..336 loop
      before_count:=jsonb_array_length(s->'players'->seat->'hand'); s:=clash_private.draw(s,seat,1); h:=s->'players'->seat->'hand';
      exit when jsonb_array_length(h)=before_count;
      card:=h->(jsonb_array_length(h)-1);
-     exit when card->>'color'=p_color or (elimination and jsonb_array_length(h)>=25);
+     exit when card->>'color'=p_color or jsonb_array_length(h)>=25;
     end loop;
-    s:=jsonb_set(s,'{color}',to_jsonb(p_color)); s:=jsonb_set(s,'{roulette}','false'); s:=jsonb_set(s,'{skipJump}',ps->seat->'id');
+    s:=jsonb_set(s,'{color}',to_jsonb(p_color)); s:=jsonb_set(s,'{roulette}','false');
     msg:=nm || ' chose ' || p_color || ' and drew ' || (jsonb_array_length(h)-countbefore) || ' in roulette.'; advance:=true;
    elsif (s->>'pending')::int>0 then
     if not timeout and p_action<>'draw' then raise exception 'Stack a draw card or take the penalty.'; end if;
     amount:=(s->>'pending')::int; s:=clash_private.draw(s,seat,amount);
-    s:=jsonb_set(s,'{skipJump}',ps->seat->'id');
     s:=jsonb_set(s,'{pending}','0'); s:=jsonb_set(s,'{minimum}','0'); msg:=nm || ' took a +' || amount || ' penalty.'; advance:=true;
    elsif timeout then
     if s->>'drawn' is null then s:=clash_private.draw(s,seat,1); end if;
@@ -354,15 +325,15 @@ begin
    elsif p_action='draw' then
     if s->>'drawn' is not null then raise exception 'You already drew. Play that card or pass.'; end if;
     if mode='mercy' and exists(select 1 from jsonb_array_elements(h) x where clash_private.matches(x,s)) then raise exception 'You have a playable card. Play it instead of drawing.'; end if;
-    loop
+    for j in 1..336 loop
      before_count:=jsonb_array_length(s->'players'->seat->'hand'); s:=clash_private.draw(s,seat,1); h:=s->'players'->seat->'hand';
      if jsonb_array_length(h)=before_count then advance:=true; exit; end if;
      card:=h->(jsonb_array_length(h)-1);
-     exit when mode='regular' or clash_private.matches(card,s) or (elimination and jsonb_array_length(h)>=25);
+     exit when mode='regular' or clash_private.matches(card,s) or jsonb_array_length(h)>=25;
     end loop;
     s:=jsonb_set(s,'{drawn}',coalesce(card->'id','null'::jsonb));
     msg:=nm || ' drew ' || (jsonb_array_length(h)-countbefore) || ' card(s).';
-    if elimination and jsonb_array_length(h)>=25 then advance:=true; end if;
+    if mode='mercy' and jsonb_array_length(h)>=25 then advance:=true; end if;
    elsif p_action='pass' then
     if s->>'drawn' is null then raise exception 'Draw a card before passing.'; end if;
     if mode='mercy' and exists(select 1 from jsonb_array_elements(h) x where (x->>'id')::int=(s->>'drawn')::int and clash_private.matches(x,s)) then raise exception 'In No Mercy, you must play the matching card you drew.'; end if;
@@ -383,9 +354,9 @@ begin
 end $$;
 revoke all on all functions in schema clash_private from public, anon, authenticated;
 revoke all on function public.clash_state(text) from public, anon;
-revoke all on function public.clash_enter(text,text,text,boolean,boolean,boolean) from public, anon;
+revoke all on function public.clash_enter(text,text,text,boolean,boolean) from public, anon;
 revoke all on function public.clash_action(text,int,text,int,text,boolean,boolean,text) from public, anon;
 grant execute on function public.clash_state(text) to authenticated;
-grant execute on function public.clash_enter(text,text,text,boolean,boolean,boolean) to authenticated;
+grant execute on function public.clash_enter(text,text,text,boolean,boolean) to authenticated;
 grant execute on function public.clash_action(text,int,text,int,text,boolean,boolean,text) to authenticated;
 commit;
